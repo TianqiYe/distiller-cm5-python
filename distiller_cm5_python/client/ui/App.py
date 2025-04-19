@@ -4,7 +4,7 @@ from PyQt6.QtQml import QQmlApplicationEngine
 from PyQt6.QtWidgets import QApplication
 from distiller_cm5_python.client.ui.AppInfoManager import AppInfoManager
 from distiller_cm5_python.client.ui.bridge.MCPClientBridge import MCPClientBridge
-from distiller_cm5_python.client.ui.bridge.EInkRenderer import EInkRenderer
+from distiller_cm5_python.client.ui.bridge.EInkRenderer import EInkRenderer, config
 from distiller_cm5_python.client.ui.bridge.EInkRendererBridge import EInkRendererBridge
 from contextlib import AsyncExitStack
 from qasync import QEventLoop
@@ -59,6 +59,9 @@ class App:
         root_context.setContextProperty("bridge", self.bridge)
         root_context.setContextProperty("AppInfo", self.app_info)
 
+        # Set display dimensions from config
+        self._set_display_dimensions()
+
         # Get the directory containing the QML files
         current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -94,6 +97,11 @@ class App:
         if not self.engine.rootObjects():
             logger.error("Failed to load QML")
             raise RuntimeError("Failed to load QML")
+
+
+        # Apply fixed size constraints to the root window after loading
+        self._apply_window_constraints()
+
 
         # E-Ink Initialization Call
         self._init_eink_renderer()
@@ -165,28 +173,87 @@ class App:
         """Handle application quit event."""
         logger.info("Application quit requested")
 
+        # Stop the E-Ink renderer if active
+        if self.eink_renderer:
+            self.eink_renderer.stop()
+            self.eink_renderer = None
+            
+        # Clean up e-ink bridge if active
+        if self.eink_bridge:
+            self.eink_bridge.cleanup()
+            self.eink_bridge = None
+
         # Schedule bridge shutdown
         try:
             self.bridge.shutdown()
         except Exception as e:
             logger.error(f"Error during shutdown: {e}", exc_info=True)
 
+    def _set_display_dimensions(self):
+        """Set display dimensions from the config file as context properties for QML."""
+        # Get width and height from config or use defaults
+        width = int(config.get("display").get("width") or 240)
+        height = int(config.get("display").get("height") or 416)
+        
+        # Set as context properties for QML
+        rc = self.engine.rootContext()
+        rc.setContextProperty("configWidth", width)
+        rc.setContextProperty("configHeight", height)
+        logger.info(f"Set display dimensions from config: {width}x{height}")
+
+
+    def _apply_window_constraints(self):
+        """Apply fixed size constraints to the main window after QML is loaded."""
+        # Get display dimensions from config
+        width = int(config.get("display").get("width") or 240)
+        height = int(config.get("display").get("height") or 416)
+        
+        # Find the root window object
+        root_objects = self.engine.rootObjects()
+        if not root_objects:
+            logger.error("No root objects found to apply size constraints")
+            return
+
+        main_window = root_objects[0]
+        
+        try:
+            # Set fixed size - use QML properties for ApplicationWindow
+            main_window.setProperty("width", width)
+            main_window.setProperty("height", height)
+            
+            # These may or may not be available, depending on the window type
+            try:
+                main_window.setProperty("minimumWidth", width)
+                main_window.setProperty("maximumWidth", width)
+                main_window.setProperty("minimumHeight", height)
+                main_window.setProperty("maximumHeight", height)
+                
+                # For ApplicationWindow, we set the flag in QML directly
+                # So we don't need to do main_window.setFlags() here
+            except Exception as e:
+                logger.warning(f"Could not set all window constraints: {e}")
+                
+            logger.info(f"Applied fixed size constraints: {width}x{height}")
+        except Exception as e:
+            logger.error(f"Error applying window constraints: {e}", exc_info=True)
+    
+
     # E-Ink Methods
     def _init_eink_renderer(self):
         """Initialize the E-Ink renderer."""
-        # TODO: Check configuration if e-ink mode is enabled
-        eink_enabled = True # Placeholder: Get from config
-
+        # Check if e-ink mode is enabled in config
+        eink_enabled = config.get("display").get("eink_enabled")
+        
         if not eink_enabled:
             logger.info("E-Ink display mode not enabled")
             return
 
         logger.info("E-Ink display mode enabled")
 
-        # TODO: Get configuration for e-ink renderer from actual config source
-        capture_interval = 500 # Placeholder: Get from config
-        buffer_size = 2 # Placeholder: Get from config
-        dithering_enabled = True # Placeholder: Get from config
+        # Get configuration for e-ink renderer
+        capture_interval = config.get("display").get("eink_refresh_interval")
+        buffer_size = config.get("display").get("eink_buffer_size") 
+        dithering_enabled = config.get("display").get("eink_dithering_enabled")
 
         try:
             # First initialize the e-ink bridge that connects to the hardware
@@ -208,9 +275,12 @@ class App:
                 buffer_size=buffer_size
             )
 
-            # Connect frameReady signal
-            self.eink_renderer.frameReady.connect(self._handle_eink_frame)
-
+            # Create a lambda function to handle the signal instead of direct method connection
+            # This avoids the null pointer issue
+            self.eink_renderer.frameReady.connect(
+                lambda data, w, h: self._handle_eink_frame(data, w, h)
+            )
+            
             # Start capturing frames
             self.eink_renderer.start()
             logger.info(f"E-Ink renderer initialized with {capture_interval}ms interval")
@@ -225,15 +295,20 @@ class App:
     def _handle_eink_frame(self, frame_data, width, height):
         """
         Handle a new frame from the E-Ink renderer.
-        Forwards the frame to the e-ink bridge for display.
+        This method forwards the frame to the e-ink bridge for display.
+        
+        Args:
+            frame_data: The binary data for the frame
+            width: The width of the frame
+            height: The height of the frame
         """
-        # logger.debug(f"E-Ink frame ready: {width}x{height}, {len(frame_data)} bytes") # Potentially noisy
-
+        logger.debug(f"E-Ink frame ready: {width}x{height}, {len(frame_data)} bytes")
+        
         # Forward the frame to the e-ink bridge if available
         if self.eink_bridge and self.eink_bridge.initialized:
             self.eink_bridge.handle_frame(frame_data, width, height)
-        # else: # Avoid logging warning spam if bridge is intentionally disabled/not ready
-            # logger.warning("E-Ink bridge not available or not initialized")
+        else:
+            logger.warning("E-Ink bridge not available or not initialized")
 
 
 if __name__ == "__main__":

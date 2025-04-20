@@ -1,5 +1,6 @@
 # pyright: reportArgumentType=false
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import QUrl, Qt
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtQml import QQmlApplicationEngine
 from PyQt6.QtWidgets import QApplication
 from distiller_cm5_python.client.ui.AppInfoManager import AppInfoManager
@@ -10,16 +11,19 @@ from contextlib import AsyncExitStack
 from qasync import QEventLoop
 from distiller_cm5_python.utils.logger import logger
 import asyncio
+import evdev
 import os
 import sys
+
 
 
 class App:
     def __init__(self):
         """Initialize the Qt application and QML engine."""
-        # Set platform to offscreen before creating QApplication if E-Ink is enabled
-        # TODO: Make this conditional based on configuration
-        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        
+        if config.get("display").get("eink_enabled"):
+            os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("PamirAI Assistant")
         self.app.setOrganizationName("PamirAI Inc")
@@ -38,6 +42,8 @@ class App:
         # E-Ink Initialization
         self.eink_renderer = None
         self.eink_bridge = None
+        self._eink_initialized = False
+        self._input_monitor_task = None # Task handle for input monitoring
 
         # Connect signal to handle application quit
         self.app.aboutToQuit.connect(self.handle_quit)
@@ -99,14 +105,70 @@ class App:
             raise RuntimeError("Failed to load QML")
 
 
-        # Apply fixed size constraints to the root window after loading
-        self._apply_window_constraints()
+        if config.get("display").get("eink_enabled"):
+            # Apply fixed size constraints to the root window after loading
+            self._apply_window_constraints()
+            # E-Ink Initialization Call
+            self._init_eink_renderer()
+            self._eink_initialized = True
 
-
-        # E-Ink Initialization Call
-        self._init_eink_renderer()
+        # Start monitoring input device
+        root_objects = self.engine.rootObjects()
+        if root_objects:
+            main_window = root_objects[0]
+            input_device_path = '/dev/input/event5' # TODO: Make this configurable?
+            logger.info(f"Starting input device monitor for {input_device_path}...")
+            self._input_monitor_task = self.loop.create_task(self.monitor_input_device(input_device_path, main_window))
+        else:
+            logger.error("Cannot start input monitor: No root QML object found.")
 
         logger.info("Application initialized successfully")
+
+
+    async def monitor_input_device(self, device_path, target_widget):
+        """Monitor the specified input device for key presses and post Qt events."""
+        try:
+            dev = evdev.InputDevice(device_path)
+            logger.info(f"Monitoring input device: {dev.path} ({dev.name})")
+        except FileNotFoundError:
+            logger.error(f"Input device not found: {device_path}. Is the button script running?")
+            return
+        except PermissionError:
+            logger.error(f"Permission denied for input device: {device_path}. Check user permissions.")
+            return
+        except Exception as e:
+            logger.error(f"Failed to open input device {device_path}: {e}", exc_info=True)
+            return
+
+        try:
+            async for event in dev.async_read_loop():
+                if event.type == evdev.ecodes.EV_KEY and event.value == 1: # Key press events
+                    key_to_post = None
+                    if event.code == evdev.ecodes.KEY_ENTER:
+                        key_to_post = Qt.Key.Key_Enter
+                        logger.debug("Detected ENTER key press")
+                    elif event.code == evdev.ecodes.KEY_UP:
+                        key_to_post = Qt.Key.Key_Up
+                        logger.debug("Detected UP key press")
+                    elif event.code == evdev.ecodes.KEY_DOWN:
+                        key_to_post = Qt.Key.Key_Down
+                        logger.debug("Detected DOWN key press")
+                    
+                    if key_to_post and target_widget:
+                        press_event = QKeyEvent(QKeyEvent.Type.KeyPress, key_to_post, Qt.KeyboardModifier.NoModifier)
+                        release_event = QKeyEvent(QKeyEvent.Type.KeyRelease, key_to_post, Qt.KeyboardModifier.NoModifier)
+                        QApplication.postEvent(target_widget, press_event)
+                        # Optionally post release event immediately or based on event.value == 0 if needed
+                        QApplication.postEvent(target_widget, release_event) 
+                        logger.debug(f"Posted {key_to_post} event to {target_widget}")
+
+        except OSError as e:
+             logger.error(f"Error reading from input device {device_path}: {e}. Device might have been disconnected.", exc_info=True)
+        except Exception as e:
+             logger.error(f"Unexpected error in input monitoring loop for {device_path}: {e}", exc_info=True)
+        finally:
+            logger.info(f"Stopped monitoring input device: {device_path}")
+            dev.close() # Ensure device is closed
 
     async def run(self):
         """Run the application with async event loop."""
@@ -141,6 +203,21 @@ class App:
             logger.info("Application exited")
             return 0
 
+    def _cleanup_eink(self):
+        """Cleanup E-Ink resources."""
+        try:
+            if self.eink_renderer:
+                self.eink_renderer.stop()
+                self.eink_renderer = None
+
+            if self.eink_bridge:
+                self.eink_bridge.cleanup()
+                self.eink_bridge = None
+
+            self._eink_initialized = False
+        except Exception as e:
+            logger.error(f"Error during E-Ink cleanup: {e}", exc_info=True)
+
     async def _cleanup_resources(self):
         """Cleanup resources registered with exit_stack."""
         logger.info("Cleaning up resources from exit stack")
@@ -149,18 +226,23 @@ class App:
             if hasattr(self, "bridge") and self.bridge:
                 await self.bridge.cleanup()
 
-            # E-Ink Cleanup
-            # Stop the E-Ink renderer if active
-            if self.eink_renderer:
-                self.eink_renderer.stop()
-                logger.info("E-Ink renderer stopped.")
-                self.eink_renderer = None
-
-            # Clean up e-ink bridge if active
-            if self.eink_bridge:
-                self.eink_bridge.cleanup()
-                logger.info("E-Ink bridge cleaned up.")
-                self.eink_bridge = None
+            if config.get("display").get("eink_enabled"):
+                self._cleanup_eink()
+            
+            # Cancel the input monitoring task if running
+            if self._input_monitor_task and not self._input_monitor_task.done():
+                logger.info("Cancelling input monitor task...")
+                self._input_monitor_task.cancel()
+                try:
+                    # Give the task a moment to cancel
+                    await asyncio.wait_for(self._input_monitor_task, timeout=1.0) 
+                except asyncio.CancelledError:
+                    logger.info("Input monitor task successfully cancelled.")
+                except asyncio.TimeoutError:
+                     logger.warning("Input monitor task did not cancel within timeout.")
+                except Exception as e:
+                    logger.error(f"Error during input monitor task cancellation: {e}", exc_info=True)
+            self._input_monitor_task = None
 
         except Exception as e:
             logger.error(f"Error during resource cleanup: {e}", exc_info=True)
@@ -241,11 +323,18 @@ class App:
     # E-Ink Methods
     def _init_eink_renderer(self):
         """Initialize the E-Ink renderer."""
+        logger.info(f"config: {config}")
+
+
+        if not config.get("display").get("eink_enabled"):
+            logger.warning("E-Ink display mode disabled in configuration")
+            return 
+
         # Check if e-ink mode is enabled in config
         eink_enabled = config.get("display").get("eink_enabled")
         
         if not eink_enabled:
-            logger.info("E-Ink display mode not enabled")
+            logger.warning("E-Ink display mode disabled in configuration")
             return
 
         logger.info("E-Ink display mode enabled")
@@ -263,7 +352,7 @@ class App:
             if not init_success:
                 logger.error("Failed to initialize e-ink bridge")
                 self.eink_bridge = None
-                return
+                return False
 
             # Configure dithering
             self.eink_bridge.set_dithering(dithering_enabled)
@@ -284,6 +373,10 @@ class App:
             # Start capturing frames
             self.eink_renderer.start()
             logger.info(f"E-Ink renderer initialized with {capture_interval}ms interval")
+
+            self._eink_initialized = True
+            return True
+
         except Exception as e:
             logger.error(f"Error initializing E-Ink renderer: {e}", exc_info=True)
             # Clean up resources on failure
@@ -291,6 +384,8 @@ class App:
                 self.eink_bridge.cleanup()
                 self.eink_bridge = None
             self.eink_renderer = None
+            return False
+
 
     def _handle_eink_frame(self, frame_data, width, height):
         """

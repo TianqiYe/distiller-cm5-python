@@ -8,7 +8,10 @@ NavigableItem {
     property bool useFixedHeight: true
     property string text: ""
     property color backgroundColor: getBackgroundColor()
-    property color textColor: root.visualFocus ? "#FFFFFF" : (ThemeManager.textColor || "#000000")
+    property color textColor: root.visualFocus ? 
+                             (ThemeManager.darkMode ? "#000000" : "#FFFFFF") : 
+                             (ThemeManager.textColor || "#000000")
+    property int fontSize: FontManager.fontSizeSmall
     
     width: parent ? parent.width : implicitWidth
     height: useFixedHeight ? ThemeManager.buttonHeight : implicitHeight
@@ -43,7 +46,7 @@ NavigableItem {
         anchors.centerIn: parent
         text: root.text
         color: root.textColor
-        font.pixelSize: FontManager.fontSizeNormal
+        font.pixelSize: root.fontSize
         font.family: FontManager.primaryFontFamily
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter

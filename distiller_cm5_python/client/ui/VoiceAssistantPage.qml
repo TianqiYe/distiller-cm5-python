@@ -17,6 +17,8 @@ PageBase {
     property string inputBuffer: ""
     property var focusableItems: []
     property var previousFocusedItem: null
+    // Add a property to store the full transcription result
+    property string lastTranscription: ""
 
     signal selectNewServer()
 
@@ -44,10 +46,11 @@ PageBase {
                 focusableItems.push(inputArea.voiceButton)
             }
             
-            if (inputArea.sendButton && inputArea.sendButton.navigable) {
-                console.log("Adding send button to focusable items");
-                focusableItems.push(inputArea.sendButton)
-            }
+            // Send Button removed from focus list
+            // if (inputArea.sendButton && inputArea.sendButton.navigable) {
+            //     console.log("Adding send button to focusable items");
+            //     focusableItems.push(inputArea.sendButton)
+            // }
         } else {
             console.log("InputArea not found or not fully initialized yet");
         }
@@ -121,6 +124,69 @@ PageBase {
             }
         }
     }
+
+    // --- Connect to AppController for Whisper Signals/Slots ---
+    Connections {
+        target: AppController
+        ignoreUnknownSignals: true // Good practice
+
+        function onRecordingStateChanged(is_recording) {
+            console.log("QML received recordingStateChanged:", is_recording)
+            isListening = is_recording
+            statusText = is_recording ? "Listening..." : "Ready"
+            // Update voice button visual state (might need adjustment based on actual button implementation)
+            if (inputArea && inputArea.voiceButton) {
+                inputArea.voiceButton.checked = is_recording
+                // Optionally change icon or style here too based on is_recording
+                // e.g., inputArea.voiceButton.icon.source = is_recording ? "..." : "..."
+            }
+            if (is_recording) {
+                // Clear previous transcription when starting new recording
+                lastTranscription = ""
+                inputBuffer = "" // Clear text input field when starting voice
+            } else {
+                 statusText = "Processing..." // Show processing after recording stops
+            }
+        }
+
+        function onTranscriptionUpdate(transcription) {
+            // console.log("QML received transcriptionUpdate:", transcription)
+            // Append segment to the input buffer in real-time (optional)
+            // inputBuffer = inputBuffer + transcription + " " 
+            // Alternatively, update status or a dedicated field
+            // statusText = "Transcribing: " + transcription
+        }
+
+        function onTranscriptionComplete(full_text) {
+            console.log("QML received transcriptionComplete:", full_text)
+            if (full_text === "[Transcription Error]") {
+                 statusText = "Error during transcription."
+                 // Show an error message to the user, e.g., using MessageToast
+                 messageToast.showMessage("Transcription Failed", 2000)
+                 inputBuffer = "" // Clear potentially partial input
+            } else if (full_text.trim() !== "") {
+                 lastTranscription = full_text
+                 // inputBuffer = full_text // Don't put text in removed input field
+                 statusText = "Sending..." 
+                 // Optional: Automatically send the transcribed text
+                 if (bridge && bridge.ready) {
+                     console.log("Sending transcribed text:", full_text)
+                     bridge.submit_query(full_text)
+                 } else {
+                     console.error("Bridge not ready, cannot send transcription")
+                     statusText = "Error: Not Connected" // Update status
+                     messageToast.showMessage("Error: Not connected", 2000)
+                 }
+                 // Note: isProcessing state will be reset by onMessageReceived from bridge
+                 // or potentially after a timeout if send fails or no response comes.
+            } else {
+                 statusText = "Ready (No speech detected)" // Or just "Ready"
+                 // inputBuffer = "" // No input buffer to clear
+            }
+             isProcessing = false // Ensure processing state is reset
+        }
+    }
+    // --- End AppController Connections ---
 
     // Header area with server name and status
     VoiceAssistantPageHeader {
@@ -286,33 +352,21 @@ PageBase {
         isListening: voiceAssistantPage.isListening
         isProcessing: voiceAssistantPage.isProcessing
         
-        onTextSubmitted: function(text) {
-            if (bridge && bridge.ready && bridge.isConnected && !isProcessing) {
-                inputBuffer = text;
-                if (bridge.sendTextMessage(text)) {
-                    isProcessing = true;
-                    statusText = "Processing...";
-                    // Set response in progress to lock scrolling
-                    conversationView.setResponseInProgress(true);
-                }
-            }
-        }
-        
-        onVoiceToggled: function(listening) {
-            if (bridge && bridge.ready && bridge.isConnected && !isProcessing) {
-                if (listening) {
-                    bridge.startListening();
-                } else {
-                    bridge.stopListening();
-                }
-            }
-        }
-        
         onSettingsClicked: {
             // Navigate to the settings page using the application-defined function
             if (mainWindow && typeof mainWindow.pushSettingsPage === "function") {
                 mainWindow.pushSettingsPage();
             }
+        }
+
+        // Connect the new InputArea signals to AppController slots
+        onVoicePressed: {
+            console.log("InputArea voicePressed signal received by page.")
+            AppController.startRecording()
+        }
+        onVoiceReleased: {
+            console.log("InputArea voiceReleased signal received by page.")
+            AppController.stopAndTranscribe()
         }
     }
     
@@ -349,54 +403,44 @@ PageBase {
     // Timer to restore focus after dialog is closed
     Timer {
         id: restoreFocusTimer
-        interval: 100
+        interval: 50 // Short delay to ensure focus is set after dialog closes
         repeat: false
         running: false
-        
         onTriggered: {
-            console.log("Restore focus timer triggered");
-            // First make sure focus items are properly initialized
-            collectFocusItems();
-            
-            // Log the state for debugging
-            console.log("Current focus index: " + FocusManager.currentFocusIndex);
-            console.log("Focusable items count: " + focusableItems.length);
-            console.log("Has previous focus item: " + (previousFocusedItem !== null));
-            
-            // Then try to restore focus to the previous item or a default item
-            if (previousFocusedItem && previousFocusedItem.navigable) {
-                console.log("Restoring focus to previous item");
+            if (previousFocusedItem) {
                 FocusManager.setFocusToItem(previousFocusedItem);
-            } else if (inputArea && inputArea.voiceButton && inputArea.voiceButton.navigable) {
-                console.log("Setting focus to voice button");
-                FocusManager.setFocusToItem(inputArea.voiceButton);
-            } else if (focusableItems.length > 0) {
-                console.log("Setting focus to first non-header button");
-                // Default to the first button that's not the header button
-                for (var i = 0; i < focusableItems.length; i++) {
-                    if (focusableItems[i] !== header.serverSelectButton) {
-                        FocusManager.setFocusToItem(focusableItems[i]);
-                        break;
-                    }
-                }
             } else {
-                console.error("No focusable items available to restore focus");
+                // Fallback if previous item is lost
+                ensureFocusableItemsHaveFocus(); 
             }
-            
-            // Double-check that something has focus
-            focusCheckTimer.start();
+            previousFocusedItem = null; // Clear stored item
         }
     }
-    
-    // Timer to verify focus state after initial restoration
-    Timer {
-        id: focusCheckTimer
-        interval: 200
-        repeat: false
-        running: false
-        onTriggered: {
-            ensureFocusableItemsHaveFocus();
+
+    // --- Key Handling ---
+    focus: true // Ensure the page receives key events
+    Keys.onPressed: (event) => {
+        if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return) {
+            let currentItem = FocusManager.getCurrentFocusItem();
+            if (currentItem === inputArea.voiceButton) {
+                console.log("Enter pressed on voiceButton, intercepting default activation.");
+                // We don't want Enter to toggle the voice button via FocusManager activation.
+                // If keyboard push-to-talk is desired, logic would go here.
+                // For now, just consume the event.
+                event.accepted = true;
+                // DO NOT CALL FocusManager.handleKeyPress(event) here
+            } else {
+                // Allow Enter to proceed for other elements (e.g., send button, future text inputs)
+                // and let FocusManager handle standard activation if needed.
+                console.log("Enter pressed on other item, allowing default handling.");
+                event.accepted = false; // Explicitly allow propagation
+                FocusManager.handleKeyPress(event); // Allow FocusManager to handle activation
+            }
+        } else {
+            // Let FocusManager handle Up/Down/Other keys
+            FocusManager.handleKeyPress(event);
         }
     }
+    // --- End Key Handling ---
 }
 

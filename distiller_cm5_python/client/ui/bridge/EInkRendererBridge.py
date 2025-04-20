@@ -5,7 +5,8 @@ from threading import Lock
 from PyQt6.QtCore import QObject, pyqtSlot, QTimer
 from PyQt6.QtGui import QImage
 from numba import jit
-from .Eink_Driver import EinkDriver, config
+from .EinkDriver import EinkDriver
+from ..display_config import config
 
 class EInkRendererBridge(QObject):
     """
